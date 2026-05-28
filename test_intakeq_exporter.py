@@ -1,8 +1,37 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 import intakeq_exporter as exporter
+
+
+class IntakeQClientRetryTests(unittest.TestCase):
+    def _make_response(self, body: bytes = b"[]", content_type: str = "application/json"):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        response.read.return_value = body
+        response.headers.get.return_value = content_type
+        return response
+
+    def test_request_retries_on_connection_reset_error(self):
+        api = exporter.IntakeQClient("fake-key", delay_seconds=0, max_retries=2)
+        success_response = self._make_response()
+        calls = {"n": 0}
+
+        def fake_urlopen(*_args, **_kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ConnectionResetError(104, "Connection reset by peer")
+            return success_response
+
+        with mock.patch.object(exporter.urllib.request, "urlopen", side_effect=fake_urlopen), \
+                mock.patch.object(exporter.time, "sleep"):
+            result = api.get_json("clients")
+
+        self.assertEqual(result, [])
+        self.assertEqual(calls["n"], 2)
 
 
 class FakeAPI:

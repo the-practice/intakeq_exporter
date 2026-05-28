@@ -111,18 +111,19 @@ class IntakeQClient:
                 raise IntakeQAPIError(
                     f"{method} {path} failed with HTTP {exc.code}: {body[:800]}"
                 ) from exc
-            except urllib.error.URLError as exc:
+            except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
                 self._last_request_at = time.monotonic()
+                reason = getattr(exc, "reason", None) or str(exc) or type(exc).__name__
                 if attempt < self.max_retries:
                     wait_seconds = min(60.0, max(self.delay_seconds, 2.0**attempt))
                     print(
                         f"Network error; retrying in {wait_seconds:.1f}s "
-                        f"({method} {path}): {exc.reason}",
+                        f"({method} {path}): {reason}",
                         file=sys.stderr,
                     )
                     time.sleep(wait_seconds)
                     continue
-                raise IntakeQAPIError(f"{method} {path} failed: {exc.reason}") from exc
+                raise IntakeQAPIError(f"{method} {path} failed: {reason}") from exc
 
         raise IntakeQAPIError(f"{method} {path} failed after retries")
 
