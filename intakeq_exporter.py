@@ -233,7 +233,32 @@ def fetch_clients(
     return clients
 
 
-def fetch_full_intakes(
+def load_or_fetch_list(
+    output_dir: Path,
+    phase: str,
+    fetch_fn: Callable[[], list[dict[str, Any]]],
+    *,
+    log: ProgressLog = default_log,
+) -> list[dict[str, Any]]:
+    json_path = output_dir / f"{phase}.json"
+    if json_path.exists() and json_path.stat().st_size > 0:
+        try:
+            data = json.loads(json_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            log(f"Resume: {json_path.name} is unreadable, refetching.")
+        else:
+            if isinstance(data, list):
+                log(f"Resume: loaded {len(data)} {phase} records from {json_path.name}.")
+                return data
+            log(f"Resume: {json_path.name} is not a list, refetching.")
+
+    data = fetch_fn()
+    write_json(json_path, data)
+    write_csv(output_dir / f"{phase}.csv", data)
+    return data
+
+
+def fetch_full_intakes_resumable(
     api: IntakeQClient,
     summaries: list[dict[str, Any]],
     *,
@@ -241,26 +266,54 @@ def fetch_full_intakes(
     download_pdfs: bool,
     max_intakes: int | None,
     log: ProgressLog = default_log,
-) -> list[dict[str, Any]]:
-    full_intakes: list[dict[str, Any]] = []
-    selected_summaries = summaries[:max_intakes] if max_intakes is not None else summaries
+) -> tuple[list[dict[str, Any]], list[str]]:
+    intakes_dir = output_dir / "intakes_full"
+    intakes_dir.mkdir(parents=True, exist_ok=True)
 
-    for index, summary in enumerate(selected_summaries, start=1):
+    selected = summaries[:max_intakes] if max_intakes is not None else summaries
+    full_intakes: list[dict[str, Any]] = []
+    skipped: list[str] = []
+
+    for index, summary in enumerate(selected, start=1):
         intake_id = summary.get("Id")
         if not intake_id:
             log(f"Skipping intake summary without Id at index {index}")
             continue
 
-        log(f"Fetching full intake {index}/{len(selected_summaries)}: {intake_id}")
-        full_intake = api.get_json(f"intakes/{quote_segment(intake_id)}")
-        if isinstance(full_intake, dict):
-            full_intakes.append(full_intake)
-            if download_pdfs:
-                download_intake_pdfs(api, output_dir, full_intake, log=log)
-        else:
-            log(f"Skipping non-object full intake response for {intake_id}")
+        intake_file = intakes_dir / f"{safe_filename(str(intake_id))}.json"
+        if intake_file.exists() and intake_file.stat().st_size > 0:
+            try:
+                cached = json.loads(intake_file.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                log(f"Resume: {intake_file.name} is unreadable, refetching.")
+            else:
+                if isinstance(cached, dict):
+                    full_intakes.append(cached)
+                    continue
 
-    return full_intakes
+        log(f"Fetching full intake {index}/{len(selected)}: {intake_id}")
+        try:
+            full_intake = api.get_json(f"intakes/{quote_segment(intake_id)}")
+        except IntakeQAPIError as exc:
+            log(f"Failed to fetch intake {intake_id}: {exc}; skipping.")
+            skipped.append(str(intake_id))
+            continue
+
+        if not isinstance(full_intake, dict):
+            log(f"Skipping non-object full intake response for {intake_id}")
+            skipped.append(str(intake_id))
+            continue
+
+        write_json(intake_file, full_intake)
+        full_intakes.append(full_intake)
+
+        if download_pdfs:
+            try:
+                download_intake_pdfs(api, output_dir, full_intake, log=log)
+            except IntakeQAPIError as exc:
+                log(f"Failed to download PDFs for {intake_id}: {exc}; continuing.")
+
+    return full_intakes, skipped
 
 
 def download_intake_pdfs(
@@ -568,45 +621,67 @@ def perform_export(
     args: argparse.Namespace,
     *,
     log: ProgressLog = default_log,
+    api: Any = None,
 ) -> ExportResult:
     validate_export_args(args)
     output_dir = args.output_dir or default_output_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    api = IntakeQClient(
-        api_key,
-        base_url=args.base_url,
-        delay_seconds=args.delay_seconds,
-    )
+    if api is None:
+        api = IntakeQClient(
+            api_key,
+            base_url=args.base_url,
+            delay_seconds=args.delay_seconds,
+        )
 
     log(f"Writing export to {output_dir.resolve()}")
 
     client_params = build_client_params(args)
     log(f"Client export scope: {client_export_scope(client_params)}")
-    clients = fetch_clients(api, args.max_pages, params=client_params, log=log)
-    appointments = fetch_paged(
-        api,
-        "appointments",
-        params={"startDate": args.start_date, "endDate": args.end_date},
-        label="appointments",
-        max_pages=args.max_pages,
+
+    clients = load_or_fetch_list(
+        output_dir,
+        "clients",
+        lambda: fetch_clients(api, args.max_pages, params=client_params, log=log),
         log=log,
     )
+
+    appointments = load_or_fetch_list(
+        output_dir,
+        "appointments",
+        lambda: fetch_paged(
+            api,
+            "appointments",
+            params={"startDate": args.start_date, "endDate": args.end_date},
+            label="appointments",
+            max_pages=args.max_pages,
+            log=log,
+        ),
+        log=log,
+    )
+
     intake_params: dict[str, Any] = {
         "startDate": args.start_date,
         "endDate": args.end_date,
     }
     if not args.submitted_only:
         intake_params["all"] = "true"
-    intake_summaries = fetch_paged(
-        api,
-        "intakes/summary",
-        params=intake_params,
-        label="intake summaries",
-        max_pages=args.max_pages,
+
+    intake_summaries = load_or_fetch_list(
+        output_dir,
+        "intakes_summary",
+        lambda: fetch_paged(
+            api,
+            "intakes/summary",
+            params=intake_params,
+            label="intake summaries",
+            max_pages=args.max_pages,
+            log=log,
+        ),
         log=log,
     )
-    full_intakes = fetch_full_intakes(
+
+    full_intakes, skipped_intakes = fetch_full_intakes_resumable(
         api,
         intake_summaries,
         output_dir=output_dir,
@@ -614,14 +689,7 @@ def perform_export(
         max_intakes=args.max_intakes,
         log=log,
     )
-
-    write_json(output_dir / "clients.json", clients)
-    write_json(output_dir / "appointments.json", appointments)
-    write_json(output_dir / "intakes_summary.json", intake_summaries)
     write_json(output_dir / "intakes_full.json", full_intakes)
-    write_csv(output_dir / "clients.csv", clients)
-    write_csv(output_dir / "appointments.csv", appointments)
-    write_csv(output_dir / "intakes_summary.csv", intake_summaries)
 
     grouped = group_by_patient(clients, appointments, full_intakes)
     write_grouped_patients(output_dir, grouped)
@@ -644,6 +712,7 @@ def perform_export(
             "fullIntakes": len(full_intakes),
             "patients": len(grouped),
         },
+        "skippedFullIntakes": skipped_intakes,
     }
     write_json(output_dir / "export_metadata.json", metadata)
 

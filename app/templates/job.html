@@ -28,6 +28,9 @@
         <pre id="log" class="log-window" aria-live="polite"></pre>
         <div class="action-bar">
           <a id="download" class="button secondary hidden" href="/exports/{{ job.id }}/download">Download ZIP</a>
+          <form id="resume-form" class="hidden" method="post" action="/jobs/{{ job.id }}/resume">
+            <button type="submit" class="button">Resume from last phase</button>
+          </form>
         </div>
       </section>
     </main>
@@ -39,6 +42,7 @@
       const jobTitle = document.querySelector("#job-title");
       const summaryElement = document.querySelector("#summary");
       const downloadLink = document.querySelector("#download");
+      const resumeForm = document.querySelector("#resume-form");
 
       function renderSummary(metadata) {
         if (!metadata || !metadata.counts) {
@@ -73,12 +77,17 @@
         if (job.status === "completed") {
           jobTitle.textContent = "Export complete";
           downloadLink.classList.remove("hidden");
+          resumeForm.classList.add("hidden");
           return;
         }
         if (job.status === "failed") {
           jobTitle.textContent = job.error || "Export failed";
+          if (job.canResume) {
+            resumeForm.classList.remove("hidden");
+          }
           return;
         }
+        resumeForm.classList.add("hidden");
         jobTitle.textContent = job.status === "running" ? "Export running" : "Export queued";
         setTimeout(refreshJob, 2500);
       }

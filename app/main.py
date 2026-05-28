@@ -48,6 +48,8 @@ class ExportJob:
         self.metadata: dict[str, Any] | None = None
         self.error: str | None = None
         self.messages: list[str] = []
+        self.api_key: str | None = None
+        self.args: argparse.Namespace | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -59,6 +61,7 @@ class ExportJob:
             "error": self.error,
             "metadata": self.metadata,
             "downloadReady": self.archive_path is not None and self.archive_path.exists(),
+            "canResume": self.status == "failed" and self.api_key is not None,
         }
 
 
@@ -200,6 +203,15 @@ def run_export_job(job_id: str, api_key: str, args: argparse.Namespace) -> None:
         set_job_status(job_id, "failed", error=f"{type(exc).__name__}: {exc}")
 
 
+def start_export_thread(job_id: str, api_key: str, args: argparse.Namespace) -> None:
+    thread = threading.Thread(
+        target=run_export_job,
+        args=(job_id, api_key, args),
+        daemon=True,
+    )
+    thread.start()
+
+
 def template_context(request: Request, **extra: Any) -> dict[str, Any]:
     return {
         "request": request,
@@ -257,17 +269,38 @@ async def start_export(
     job_dir.mkdir(parents=True, exist_ok=True)
     job = ExportJob(job_id, output_dir)
     job.messages.append(f"Queued export for {client_scope}.")
+    job.api_key = api_key
+    job.args = args
     with jobs_lock:
         jobs[job_id] = job
 
-    thread = threading.Thread(
-        target=run_export_job,
-        args=(job_id, api_key, args),
-        daemon=True,
-    )
-    thread.start()
+    start_export_thread(job_id, api_key, args)
 
     return RedirectResponse(url=f"/jobs/{job_id}", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/jobs/{job_id}/resume")
+def resume_export(job_id: str, _: None = Depends(require_admin)) -> RedirectResponse:
+    job = get_job_or_404(job_id)
+    if job.status not in {"failed"}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot resume job in status {job.status!r}",
+        )
+    if job.api_key is None or job.args is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Resume context is unavailable for this job",
+        )
+
+    with jobs_lock:
+        job.status = "queued"
+        job.error = None
+        job.updated_at = dt.datetime.now(dt.timezone.utc)
+        job.messages.append("Resuming export from last completed phase.")
+
+    start_export_thread(job.id, job.api_key, job.args)
+    return RedirectResponse(url=f"/jobs/{job.id}", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @app.get("/jobs/{job_id}", response_class=HTMLResponse)

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import intakeq_exporter as exporter
@@ -126,6 +129,216 @@ class ExporterTests(unittest.TestCase):
 
         self.assertEqual(params, {"deletedOnly": "true"})
         self.assertEqual(exporter.client_export_scope(params), "recently deleted clients")
+
+
+class StubAPI:
+    """Path-keyed canned responses; raise IntakeQAPIError by mapping to one."""
+
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls = []
+
+    def get_json(self, path, params=None):
+        self.calls.append((path, dict(params or {})))
+        if path not in self.responses:
+            raise AssertionError(f"unexpected path: {path}")
+        response = self.responses[path]
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+class LoadOrFetchListTests(unittest.TestCase):
+    def test_writes_json_and_csv_after_fetch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            records = [{"Id": 1, "Name": "A"}]
+
+            result = exporter.load_or_fetch_list(
+                output_dir, "clients", lambda: records, log=lambda _m: None
+            )
+
+            self.assertEqual(result, records)
+            self.assertTrue((output_dir / "clients.json").exists())
+            self.assertTrue((output_dir / "clients.csv").exists())
+            self.assertEqual(
+                json.loads((output_dir / "clients.json").read_text()), records
+            )
+
+    def test_loads_existing_file_without_calling_fetch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            existing = [{"Id": 1}, {"Id": 2}]
+            (output_dir / "clients.json").write_text(json.dumps(existing))
+
+            def fetch_should_not_be_called():
+                raise AssertionError("fetch_fn must not run when file exists")
+
+            result = exporter.load_or_fetch_list(
+                output_dir, "clients", fetch_should_not_be_called, log=lambda _m: None
+            )
+
+            self.assertEqual(result, existing)
+
+    def test_refetches_when_file_is_corrupt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            (output_dir / "clients.json").write_text("not json")
+            fresh = [{"Id": 9}]
+
+            result = exporter.load_or_fetch_list(
+                output_dir, "clients", lambda: fresh, log=lambda _m: None
+            )
+
+            self.assertEqual(result, fresh)
+            self.assertEqual(
+                json.loads((output_dir / "clients.json").read_text()), fresh
+            )
+
+
+class FetchFullIntakesResumableTests(unittest.TestCase):
+    def test_writes_each_intake_to_its_own_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            api = StubAPI(
+                {
+                    "intakes/i1": {"Id": "i1", "ConsentForms": []},
+                    "intakes/i2": {"Id": "i2", "ConsentForms": []},
+                }
+            )
+
+            results, skipped = exporter.fetch_full_intakes_resumable(
+                api,
+                [{"Id": "i1"}, {"Id": "i2"}],
+                output_dir=output_dir,
+                download_pdfs=False,
+                max_intakes=None,
+                log=lambda _m: None,
+            )
+
+            self.assertEqual(len(results), 2)
+            self.assertEqual(skipped, [])
+            self.assertTrue((output_dir / "intakes_full" / "i1.json").exists())
+            self.assertTrue((output_dir / "intakes_full" / "i2.json").exists())
+
+    def test_skips_intakes_already_on_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            intakes_dir = output_dir / "intakes_full"
+            intakes_dir.mkdir()
+            (intakes_dir / "i1.json").write_text(
+                json.dumps({"Id": "i1", "cached": True})
+            )
+            api = StubAPI({"intakes/i2": {"Id": "i2", "ConsentForms": []}})
+
+            results, skipped = exporter.fetch_full_intakes_resumable(
+                api,
+                [{"Id": "i1"}, {"Id": "i2"}],
+                output_dir=output_dir,
+                download_pdfs=False,
+                max_intakes=None,
+                log=lambda _m: None,
+            )
+
+            self.assertEqual(skipped, [])
+            self.assertEqual(len(results), 2)
+            paths_called = [call[0] for call in api.calls]
+            self.assertEqual(paths_called, ["intakes/i2"])
+
+    def test_continues_when_single_intake_fetch_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            api = StubAPI(
+                {
+                    "intakes/i1": exporter.IntakeQAPIError("boom"),
+                    "intakes/i2": {"Id": "i2", "ConsentForms": []},
+                }
+            )
+
+            results, skipped = exporter.fetch_full_intakes_resumable(
+                api,
+                [{"Id": "i1"}, {"Id": "i2"}],
+                output_dir=output_dir,
+                download_pdfs=False,
+                max_intakes=None,
+                log=lambda _m: None,
+            )
+
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0]["Id"], "i2")
+            self.assertEqual(skipped, ["i1"])
+
+
+class PerformExportResumeTests(unittest.TestCase):
+    def _args(self, output_dir: Path):
+        return exporter.parse_args(
+            [
+                "--output-dir",
+                str(output_dir),
+                "--start-date",
+                "2025-01-01",
+                "--end-date",
+                "2025-12-31",
+                "--delay-seconds",
+                "0",
+            ]
+        )
+
+    def test_resumes_appointments_after_failed_intakes_phase(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "data"
+
+            full_responses = {
+                "clients": [{"ClientId": 1, "ClientName": "A"}],
+                "appointments": [{"ClientId": 1, "Id": "a1"}],
+                "intakes/summary": exporter.IntakeQAPIError("intakes-down"),
+            }
+
+            class PagedStub:
+                def __init__(self, responses):
+                    self.responses = responses
+                    self.calls = []
+
+                def get_json(self, path, params=None):
+                    self.calls.append((path, dict(params or {})))
+                    response = self.responses[path]
+                    if isinstance(response, Exception):
+                        raise response
+                    page = int((params or {}).get("page", 1))
+                    return response if page == 1 else []
+
+            failing_api = PagedStub(full_responses)
+            args = self._args(output_dir)
+
+            with self.assertRaises(exporter.IntakeQAPIError):
+                exporter.perform_export(
+                    "fake", args, log=lambda _m: None, api=failing_api
+                )
+
+            self.assertTrue((output_dir / "clients.json").exists())
+            self.assertTrue((output_dir / "appointments.json").exists())
+
+            recovered_responses = {
+                "clients": exporter.IntakeQAPIError("should not refetch"),
+                "appointments": exporter.IntakeQAPIError("should not refetch"),
+                "intakes/summary": [{"Id": "i1"}],
+                "intakes/i1": {"Id": "i1", "ConsentForms": []},
+            }
+            recovered_api = PagedStub(recovered_responses)
+            args2 = self._args(output_dir)
+
+            result = exporter.perform_export(
+                "fake", args2, log=lambda _m: None, api=recovered_api
+            )
+
+            paths = [call[0] for call in recovered_api.calls]
+            self.assertNotIn("clients", paths)
+            self.assertNotIn("appointments", paths)
+            self.assertIn("intakes/summary", paths)
+            self.assertIn("intakes/i1", paths)
+            self.assertEqual(result.metadata["counts"]["clients"], 1)
+            self.assertEqual(result.metadata["counts"]["appointments"], 1)
+            self.assertEqual(result.metadata["counts"]["fullIntakes"], 1)
 
 
 if __name__ == "__main__":

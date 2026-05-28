@@ -45,13 +45,23 @@ There are **two entry points sharing one export engine**:
 
 ### Web app job model
 
-- Jobs are tracked in an in-memory `jobs: dict[str, ExportJob]` guarded by `jobs_lock` and executed in daemon `threading.Thread`s. **No persistence** — jobs and progress are lost on restart. If you add long-running features, account for this.
+- Jobs are tracked in an in-memory `jobs: dict[str, ExportJob]` guarded by `jobs_lock` and executed in daemon `threading.Thread`s. **The `jobs` dict is not persisted** — if the container restarts, in-memory state (status, messages, the api_key needed to resume) is lost. The output directory on disk survives, but a fresh job ID would be needed to re-trigger work.
+- Failed jobs expose a **Resume** button (`POST /jobs/{id}/resume`) that reuses the original `api_key` + `args` (held on `ExportJob`) and the same `output_dir`. Resume relies on the engine's per-phase + per-intake files (see below).
 - Output is written under `EXPORT_ROOT` (defaults to `<repo>/exports`, set to `/data/exports` on Railway with a mounted volume). Each job writes to `<EXPORT_ROOT>/<job_id>/data/` and the ZIP is created next to it as `intakeq_export_<job_id>.zip`.
 - Basic auth (`require_admin`) is only enforced when `EXPORTER_ADMIN_PASSWORD` is set — locally the form is unauthenticated by default. `EXPORTER_ADMIN_USERNAME` defaults to `admin`.
 
-### Output layout (written by `perform_export`)
+### Output layout and incremental writes
 
-Top-level JSON+CSV pairs (`clients`, `appointments`, `intakes_summary`), plus `intakes_full.json`, `export_metadata.json`, a `by_patient/` tree, and optional `pdfs/intakes/` + `pdfs/consents/` when `--download-pdfs` is set.
+`perform_export` writes each phase to disk as it completes — not at the end — so a crash mid-run leaves a resumable partial export:
+
+- `clients.json` / `clients.csv` — written after the clients phase.
+- `appointments.json` / `appointments.csv` — written after the appointments phase.
+- `intakes_summary.json` / `intakes_summary.csv` — written after the summary phase.
+- `intakes_full/<intake_id>.json` — one file per full intake, written as each is fetched. The aggregated `intakes_full.json` is collated at the end.
+- `export_metadata.json` — final write; includes `skippedFullIntakes` listing intake IDs whose individual fetch failed but did not abort the run.
+- Optional `pdfs/intakes/` + `pdfs/consents/` when `--download-pdfs` is set.
+
+`load_or_fetch_list` and `fetch_full_intakes_resumable` provide the resume semantics: if a phase JSON exists and parses, it's loaded instead of being refetched; per-intake files are skipped individually. Per-intake API failures are logged + skipped (recorded in `skippedFullIntakes`) rather than aborting the whole run; whole-phase failures still propagate. To force a re-fetch, delete the relevant file before resuming.
 
 ## Conventions
 
