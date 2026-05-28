@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import email.message
+import io
 import json
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -35,6 +38,39 @@ class IntakeQClientRetryTests(unittest.TestCase):
 
         self.assertEqual(result, [])
         self.assertEqual(calls["n"], 2)
+
+    def _make_http_error(self, code: int, body: bytes = b'{"Message":"err"}'):
+        hdrs = email.message.Message()
+        return urllib.error.HTTPError(
+            url="http://example.test/x",
+            code=code,
+            msg="error",
+            hdrs=hdrs,
+            fp=io.BytesIO(body),
+        )
+
+    def test_request_waits_at_least_sixty_seconds_on_429(self):
+        api = exporter.IntakeQClient("fake-key", delay_seconds=0, max_retries=3)
+        success_response = self._make_response()
+        sleeps: list[float] = []
+        calls = {"n": 0}
+
+        def fake_urlopen(*_args, **_kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise self._make_http_error(429, b'{"Message":"Too many requests."}')
+            return success_response
+
+        with mock.patch.object(exporter.urllib.request, "urlopen", side_effect=fake_urlopen), \
+                mock.patch.object(exporter.time, "sleep", side_effect=lambda s: sleeps.append(s)):
+            result = api.get_json("clients")
+
+        self.assertEqual(result, [])
+        self.assertEqual(calls["n"], 2)
+        self.assertTrue(
+            any(s >= 60 for s in sleeps),
+            f"Expected at least one sleep >= 60s on 429 retry, got {sleeps}",
+        )
 
 
 class FakeAPI:
@@ -194,6 +230,98 @@ class LoadOrFetchListTests(unittest.TestCase):
             self.assertEqual(
                 json.loads((output_dir / "clients.json").read_text()), fresh
             )
+
+
+class PagedListAPI:
+    """API stub that returns canned page responses; failures map to exceptions."""
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.calls = []
+
+    def get_json(self, path, params=None):
+        self.calls.append((path, dict(params or {})))
+        page = int((params or {}).get("page", 1))
+        if page > len(self.pages):
+            return []
+        response = self.pages[page - 1]
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+class LoadOrFetchPagedListTests(unittest.TestCase):
+    def test_writes_each_page_to_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            page1 = [{"Id": i} for i in range(exporter.PAGE_SIZE)]
+            page2 = [{"Id": "last"}]
+            api = PagedListAPI([page1, page2])
+
+            result = exporter.load_or_fetch_paged_list(
+                output_dir,
+                "appointments",
+                api,
+                "appointments",
+                params={"startDate": "2025-01-01"},
+                label="appointments",
+                log=lambda _m: None,
+            )
+
+            self.assertEqual(len(result), exporter.PAGE_SIZE + 1)
+            self.assertTrue((output_dir / "_appointments_pages" / "page_00001.json").exists())
+            self.assertTrue((output_dir / "_appointments_pages" / "page_00002.json").exists())
+            self.assertTrue((output_dir / "appointments.json").exists())
+
+    def test_resumes_from_existing_page_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            pages_dir = output_dir / "_appointments_pages"
+            pages_dir.mkdir(parents=True)
+            page1 = [{"Id": i} for i in range(exporter.PAGE_SIZE)]
+            (pages_dir / "page_00001.json").write_text(json.dumps(page1))
+
+            api = PagedListAPI([None, [{"Id": "page2"}]])
+
+            result = exporter.load_or_fetch_paged_list(
+                output_dir,
+                "appointments",
+                api,
+                "appointments",
+                params={},
+                label="appointments",
+                log=lambda _m: None,
+            )
+
+            self.assertEqual(len(result), exporter.PAGE_SIZE + 1)
+            pages_called = [int(call[1]["page"]) for call in api.calls]
+            self.assertEqual(pages_called, [2])
+
+    def test_partial_pages_survive_mid_phase_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            page1 = [{"Id": i} for i in range(exporter.PAGE_SIZE)]
+            failure = exporter.IntakeQAPIError("429 boom")
+            api = PagedListAPI([page1, failure])
+
+            with self.assertRaises(exporter.IntakeQAPIError):
+                exporter.load_or_fetch_paged_list(
+                    output_dir,
+                    "appointments",
+                    api,
+                    "appointments",
+                    params={},
+                    label="appointments",
+                    log=lambda _m: None,
+                )
+
+            page1_file = output_dir / "_appointments_pages" / "page_00001.json"
+            self.assertTrue(page1_file.exists())
+            self.assertEqual(
+                json.loads(page1_file.read_text()),
+                page1,
+            )
+            self.assertFalse((output_dir / "appointments.json").exists())
 
 
 class FetchFullIntakesResumableTests(unittest.TestCase):

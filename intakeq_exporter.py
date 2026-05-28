@@ -23,6 +23,8 @@ BASE_URL = "https://intakeq.com/api/v1"
 DEFAULT_START_DATE = "1900-01-01"
 DEFAULT_END_DATE = "2100-12-31"
 DEFAULT_DELAY_SECONDS = 6.2
+RATE_LIMIT_BASE_WAIT_SECONDS = 60.0
+RATE_LIMIT_MAX_WAIT_SECONDS = 300.0
 PAGE_SIZE = 100
 ProgressLog = Callable[[str], None]
 
@@ -100,7 +102,13 @@ class IntakeQClient:
                 if exc.code in {429, 500, 502, 503, 504} and attempt < self.max_retries:
                     wait_seconds = retry_after_seconds(exc.headers.get("Retry-After"))
                     if wait_seconds is None:
-                        wait_seconds = min(60.0, max(self.delay_seconds, 2.0**attempt))
+                        if exc.code == 429:
+                            wait_seconds = min(
+                                RATE_LIMIT_MAX_WAIT_SECONDS,
+                                RATE_LIMIT_BASE_WAIT_SECONDS * (2 ** attempt),
+                            )
+                        else:
+                            wait_seconds = min(60.0, max(self.delay_seconds, 2.0**attempt))
                     print(
                         f"Request hit HTTP {exc.code}; retrying in {wait_seconds:.1f}s "
                         f"({method} {path})",
@@ -231,6 +239,76 @@ def fetch_clients(
         )
 
     return clients
+
+
+def load_or_fetch_paged_list(
+    output_dir: Path,
+    phase: str,
+    api: IntakeQClient,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    label: str,
+    max_pages: int | None = None,
+    log: ProgressLog = default_log,
+) -> list[dict[str, Any]]:
+    json_path = output_dir / f"{phase}.json"
+    if json_path.exists() and json_path.stat().st_size > 0:
+        try:
+            cached = json.loads(json_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            log(f"Resume: {json_path.name} is unreadable, refetching.")
+        else:
+            if isinstance(cached, list):
+                log(f"Resume: loaded {len(cached)} {phase} records from {json_path.name}.")
+                return cached
+            log(f"Resume: {json_path.name} is not a list, refetching.")
+
+    pages_dir = output_dir / f"_{phase}_pages"
+    pages_dir.mkdir(parents=True, exist_ok=True)
+
+    all_items: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        if max_pages is not None and page > max_pages:
+            break
+
+        page_file = pages_dir / f"page_{page:05d}.json"
+        cached_page: list[dict[str, Any]] | None = None
+        if page_file.exists() and page_file.stat().st_size > 0:
+            try:
+                value = json.loads(page_file.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                value = None
+            if isinstance(value, list):
+                cached_page = value
+
+        if cached_page is not None:
+            log(f"Resume: loaded cached {label} page {page} ({len(cached_page)} records).")
+            page_items = cached_page
+        else:
+            request_params = dict(params or {})
+            request_params["page"] = page
+            log(f"Fetching {label} page {page}...")
+            page_items = api.get_json(path, request_params)
+            if page_items is None:
+                page_items = []
+            if not isinstance(page_items, list):
+                raise IntakeQAPIError(
+                    f"Expected list from {path}, got {type(page_items).__name__}"
+                )
+            write_json(page_file, page_items)
+
+        if not page_items:
+            break
+        all_items.extend(page_items)
+        if len(page_items) < PAGE_SIZE:
+            break
+        page += 1
+
+    write_json(json_path, all_items)
+    write_csv(output_dir / f"{phase}.csv", all_items)
+    return all_items
 
 
 def load_or_fetch_list(
@@ -646,17 +724,14 @@ def perform_export(
         log=log,
     )
 
-    appointments = load_or_fetch_list(
+    appointments = load_or_fetch_paged_list(
         output_dir,
         "appointments",
-        lambda: fetch_paged(
-            api,
-            "appointments",
-            params={"startDate": args.start_date, "endDate": args.end_date},
-            label="appointments",
-            max_pages=args.max_pages,
-            log=log,
-        ),
+        api,
+        "appointments",
+        params={"startDate": args.start_date, "endDate": args.end_date},
+        label="appointments",
+        max_pages=args.max_pages,
         log=log,
     )
 
@@ -667,17 +742,14 @@ def perform_export(
     if not args.submitted_only:
         intake_params["all"] = "true"
 
-    intake_summaries = load_or_fetch_list(
+    intake_summaries = load_or_fetch_paged_list(
         output_dir,
         "intakes_summary",
-        lambda: fetch_paged(
-            api,
-            "intakes/summary",
-            params=intake_params,
-            label="intake summaries",
-            max_pages=args.max_pages,
-            log=log,
-        ),
+        api,
+        "intakes/summary",
+        params=intake_params,
+        label="intake summaries",
+        max_pages=args.max_pages,
         log=log,
     )
 

@@ -36,7 +36,7 @@ There are **two entry points sharing one export engine**:
 
 - Auth header is `X-Auth-Key` (not `Authorization`).
 - Default `delay_seconds = 6.2` because IntakeQ's standard API limit is 10 requests/minute. The throttle is per-instance and tracked via `_last_request_at`.
-- Retries on 429/500/502/503/504 and network errors, honoring `Retry-After` and otherwise using exponential backoff capped at 60s.
+- Retries on 429/500/502/503/504 and network errors, honoring `Retry-After` when present. **429s without `Retry-After` use a dedicated longer schedule** (`RATE_LIMIT_BASE_WAIT_SECONDS = 60`, exponential up to `RATE_LIMIT_MAX_WAIT_SECONDS = 300`) because IntakeQ's per-minute bucket needs at least ~60s to reset. Other 5xx and network errors keep the shorter exponential-up-to-60s schedule.
 - `fetch_paged` walks pages of size `PAGE_SIZE = 100` until a short or empty page; `max_pages` is a test-only cap.
 
 ### Per-patient grouping
@@ -55,13 +55,13 @@ There are **two entry points sharing one export engine**:
 `perform_export` writes each phase to disk as it completes — not at the end — so a crash mid-run leaves a resumable partial export:
 
 - `clients.json` / `clients.csv` — written after the clients phase.
-- `appointments.json` / `appointments.csv` — written after the appointments phase.
-- `intakes_summary.json` / `intakes_summary.csv` — written after the summary phase.
+- `appointments.json` / `appointments.csv` — written after the appointments phase. Each individual page is also written to `_appointments_pages/page_NNNNN.json` as it's fetched, so a mid-phase failure (e.g. a 429 on page 159) preserves pages 1-158 for the next resume.
+- `intakes_summary.json` / `intakes_summary.csv` — same per-page checkpointing under `_intakes_summary_pages/`.
 - `intakes_full/<intake_id>.json` — one file per full intake, written as each is fetched. The aggregated `intakes_full.json` is collated at the end.
 - `export_metadata.json` — final write; includes `skippedFullIntakes` listing intake IDs whose individual fetch failed but did not abort the run.
 - Optional `pdfs/intakes/` + `pdfs/consents/` when `--download-pdfs` is set.
 
-`load_or_fetch_list` and `fetch_full_intakes_resumable` provide the resume semantics: if a phase JSON exists and parses, it's loaded instead of being refetched; per-intake files are skipped individually. Per-intake API failures are logged + skipped (recorded in `skippedFullIntakes`) rather than aborting the whole run; whole-phase failures still propagate. To force a re-fetch, delete the relevant file before resuming.
+`load_or_fetch_paged_list` provides per-page checkpointing for paginated phases, and `fetch_full_intakes_resumable` provides per-intake checkpointing. If a phase's aggregate JSON exists and parses, it's loaded as-is and the underlying pages are not consulted; otherwise the helper walks pages 1..N, loading already-cached page files and only calling the API for missing ones. Per-intake API failures are logged + skipped (recorded in `skippedFullIntakes`) rather than aborting the whole run; whole-phase failures still propagate. To force a re-fetch, delete the relevant file (or the `_<phase>_pages/` directory) before resuming.
 
 ## Conventions
 
