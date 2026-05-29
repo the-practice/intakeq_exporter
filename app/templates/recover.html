@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Resume an export · IntakeQ Exporter</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}">
+  </head>
+  <body>
+    <main class="page-shell">
+      <header class="app-header">
+        <div>
+          <p class="eyebrow">Patient data export</p>
+          <h1>Resume an export</h1>
+        </div>
+        <div class="status-strip" aria-label="Application status">
+          <a class="status-pill" href="/">New export</a>
+        </div>
+      </header>
+
+      <div class="notice" role="status">
+        Exports on disk survive restarts. Pick one to continue — you'll re-enter
+        your API key on the next screen. Cached phases are skipped, so only
+        unfinished work is fetched again.
+      </div>
+
+      {% if recoverable_jobs %}
+        <section class="form-band">
+          <div class="section-heading">
+            <p class="eyebrow">On disk</p>
+            <h2>Recoverable exports</h2>
+          </div>
+          <ul class="recover-list">
+            {% for job in recoverable_jobs %}
+              <li class="recover-row">
+                <div>
+                  <code>{{ job.id }}</code>
+                  <span class="status-pill">{{ job.status }}</span>
+                  {% if job.complete %}<span class="status-pill secure">finished</span>{% endif %}
+                  {% if job.createdAt %}<small>{{ job.createdAt }}</small>{% endif %}
+                  {% if job.counts %}
+                    <small>
+                      {{ job.counts.clients }} clients ·
+                      {{ job.counts.appointments }} appts ·
+                      {{ job.counts.fullIntakes }} intakes
+                    </small>
+                  {% endif %}
+                </div>
+                <a class="status-pill" href="/?resume={{ job.id }}">Resume &rarr;</a>
+              </li>
+            {% endfor %}
+          </ul>
+        </section>
+      {% else %}
+        <div class="notice caution" role="status">
+          No exports found under the export directory yet.
+        </div>
+      {% endif %}
+    </main>
+  </body>
+</html>

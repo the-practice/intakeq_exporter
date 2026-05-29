@@ -48,8 +48,9 @@ There are **two entry points sharing one export engine**:
 
 ### Web app job model
 
-- Jobs are tracked in an in-memory `jobs: dict[str, ExportJob]` guarded by `jobs_lock` and executed in daemon `threading.Thread`s. **The `jobs` dict is not persisted** — if the container restarts, in-memory state (status, messages, the api_key needed to resume) is lost. The output directory on disk survives, but a fresh job ID would be needed to re-trigger work.
-- Failed jobs expose a **Resume** button (`POST /jobs/{id}/resume`) that reuses the original `api_key` + `args` (held on `ExportJob`) and the same `output_dir`. Resume relies on the engine's per-phase + per-intake files (see below).
+- Jobs are tracked in an in-memory `jobs: dict[str, ExportJob]` guarded by `jobs_lock` and executed in daemon `threading.Thread`s. The in-memory dict (status, messages, **the api_key**) is still lost on container restart — the api_key is deliberately never persisted.
+- Each job's resume state **is** persisted to disk: `persist_job_record` writes `<EXPORT_ROOT>/<job_id>/job.json` (id, status, timestamps, serialized `args` — never the api_key) at creation and on every terminal status change. This is what lets an export survive a restart.
+- Two resume paths: (1) the same-session **Resume** button (`POST /jobs/{id}/resume`) reuses the in-memory `api_key` + `args`; (2) the restart-safe path — `GET /recover` lists on-disk exports (`list_recoverable_jobs` scans `EXPORT_ROOT` for `<id>/data/`), each linking to `/?resume=<id>` which prefills the main export form. Submitting `/exports` with a `resume_job_id` reuses that job_id/`output_dir` instead of minting a new one, so the user re-enters only the api_key and the engine resumes from the on-disk checkpoint files. `valid_job_id` guards the id against path traversal.
 - Output is written under `EXPORT_ROOT` (defaults to `<repo>/exports`, set to `/data/exports` on Railway with a mounted volume). Each job writes to `<EXPORT_ROOT>/<job_id>/data/` and the ZIP is created next to it as `intakeq_export_<job_id>.zip`.
 - Basic auth (`require_admin`) is only enforced when `EXPORTER_ADMIN_PASSWORD` is set — locally the form is unauthenticated by default. `EXPORTER_ADMIN_USERNAME` defaults to `admin`.
 

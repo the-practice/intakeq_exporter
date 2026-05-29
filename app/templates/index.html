@@ -20,6 +20,7 @@
           {% else %}
             <span class="status-pill caution">Set admin password</span>
           {% endif %}
+          <a class="status-pill" href="/recover">Resume an export</a>
         </div>
       </header>
 
@@ -43,6 +44,12 @@
             <label class="field span-two">
               <span>IntakeQ API key</span>
               <input name="api_key" type="password" autocomplete="off" required>
+            </label>
+            <label class="field span-two">
+              <span>Resume existing export ID (optional)</span>
+              <input name="resume_job_id" type="text" autocomplete="off"
+                     placeholder="Leave blank to start a new export"
+                     value="{{ resume_job_id }}">
             </label>
             <label class="field">
               <span>API base URL</span>

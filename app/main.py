@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import threading
@@ -73,6 +75,82 @@ def export_root() -> Path:
     return Path(os.environ.get("EXPORT_ROOT", PROJECT_DIR / "exports")).resolve()
 
 
+_JOB_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
+
+
+def valid_job_id(job_id: str) -> bool:
+    return bool(_JOB_ID_RE.match(job_id or ""))
+
+
+def serialize_args(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        key: (str(value) if isinstance(value, Path) else value)
+        for key, value in vars(args).items()
+    }
+
+
+def job_record_path(job_id: str) -> Path:
+    return export_root() / job_id / "job.json"
+
+
+def persist_job_record(job: "ExportJob") -> None:
+    """Best-effort write of resume state to disk (never the API key)."""
+    record = {
+        "id": job.id,
+        "status": job.status,
+        "createdAt": job.created_at.isoformat(),
+        "updatedAt": job.updated_at.isoformat(),
+        "args": serialize_args(job.args) if job.args is not None else None,
+    }
+    try:
+        path = job_record_path(job.id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_job_record(job_id: str) -> dict[str, Any] | None:
+    if not valid_job_id(job_id):
+        return None
+    path = job_record_path(job_id)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def list_recoverable_jobs() -> list[dict[str, Any]]:
+    root = export_root()
+    results: list[dict[str, Any]] = []
+    if not root.exists():
+        return results
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or not (child / "data").is_dir():
+            continue
+        record = load_job_record(child.name) or {}
+        metadata: dict[str, Any] | None = None
+        meta_path = child / "data" / "export_metadata.json"
+        if meta_path.exists():
+            try:
+                metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                metadata = None
+        results.append(
+            {
+                "id": child.name,
+                "status": record.get("status", "unknown"),
+                "createdAt": record.get("createdAt"),
+                "complete": metadata is not None,
+                "counts": (metadata or {}).get("counts"),
+            }
+        )
+    return results
+
+
 def require_admin(
     credentials: HTTPBasicCredentials | None = Depends(security),
 ) -> None:
@@ -117,6 +195,7 @@ def set_job_status(job_id: str, status_value: str, *, error: str | None = None) 
         job.status = status_value
         job.error = error
         job.updated_at = dt.datetime.now(dt.timezone.utc)
+    persist_job_record(job)
 
 
 def complete_job(job_id: str, archive_path: Path, metadata: dict[str, Any]) -> None:
@@ -126,6 +205,7 @@ def complete_job(job_id: str, archive_path: Path, metadata: dict[str, Any]) -> N
         job.archive_path = archive_path
         job.metadata = metadata
         job.updated_at = dt.datetime.now(dt.timezone.utc)
+    persist_job_record(job)
 
 
 def optional_int(value: str | None) -> int | None:
@@ -223,6 +303,7 @@ def template_context(request: Request, **extra: Any) -> dict[str, Any]:
             "base_url": BASE_URL,
         },
         "admin_password_set": bool(os.environ.get("EXPORTER_ADMIN_PASSWORD")),
+        "resume_job_id": "",
         **extra,
     }
 
@@ -233,8 +314,23 @@ def healthz() -> dict[str, str]:
 
 
 @app.get("/", response_class=HTMLResponse)
-def index(request: Request, _: None = Depends(require_admin)) -> HTMLResponse:
-    return templates.TemplateResponse(request, "index.html", template_context(request))
+def index(
+    request: Request,
+    resume: str = "",
+    _: None = Depends(require_admin),
+) -> HTMLResponse:
+    return templates.TemplateResponse(
+        request, "index.html", template_context(request, resume_job_id=resume)
+    )
+
+
+@app.get("/recover", response_class=HTMLResponse)
+def recover_page(request: Request, _: None = Depends(require_admin)) -> HTMLResponse:
+    return templates.TemplateResponse(
+        request,
+        "recover.html",
+        template_context(request, recoverable_jobs=list_recoverable_jobs()),
+    )
 
 
 @app.post("/exports")
@@ -252,9 +348,37 @@ async def start_export(
             status_code=422,
         )
 
-    job_id = uuid.uuid4().hex[:12]
+    resume_id = str(form.get("resume_job_id") or "").strip()
+    if resume_id:
+        if not valid_job_id(resume_id):
+            return templates.TemplateResponse(
+                request,
+                "index.html",
+                template_context(
+                    request,
+                    error="That export ID isn't valid.",
+                    resume_job_id=resume_id,
+                ),
+                status_code=422,
+            )
+        job_id = resume_id
+    else:
+        job_id = uuid.uuid4().hex[:12]
+
     job_dir = export_root() / job_id
     output_dir = job_dir / "data"
+
+    if resume_id and not output_dir.is_dir():
+        return templates.TemplateResponse(
+            request,
+            "index.html",
+            template_context(
+                request,
+                error=f"No existing export found with ID {resume_id!r} to resume.",
+                resume_job_id=resume_id,
+            ),
+            status_code=422,
+        )
 
     try:
         args = export_args_from_form(form, output_dir)
@@ -263,17 +387,19 @@ async def start_export(
         return templates.TemplateResponse(
             request,
             "index.html",
-            template_context(request, error=str(exc)),
+            template_context(request, error=str(exc), resume_job_id=resume_id),
             status_code=422,
         )
 
     job_dir.mkdir(parents=True, exist_ok=True)
     job = ExportJob(job_id, output_dir)
-    job.messages.append(f"Queued export for {client_scope}.")
+    verb = "Resuming" if resume_id else "Queued"
+    job.messages.append(f"{verb} export for {client_scope}.")
     job.api_key = api_key
     job.args = args
     with jobs_lock:
         jobs[job_id] = job
+    persist_job_record(job)
 
     start_export_thread(job_id, api_key, args)
 
