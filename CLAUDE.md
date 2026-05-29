@@ -16,6 +16,9 @@ uvicorn app.main:app --reload
 python3 intakeq_exporter.py
 INTAKEQ_API_KEY=... python3 intakeq_exporter.py --max-pages 1 --max-intakes 5
 
+# Also emit a FHIR R4 bulk export (NDJSON) — fetches notes + per-client diagnoses
+INTAKEQ_API_KEY=... python3 intakeq_exporter.py --fhir
+
 # Tests
 python3 -m unittest                                  # all tests
 python3 -m unittest test_intakeq_exporter            # CLI/core tests only
@@ -60,6 +63,16 @@ There are **two entry points sharing one export engine**:
 - `intakes_full/<intake_id>.json` — one file per full intake, written as each is fetched. The aggregated `intakes_full.json` is collated at the end.
 - `export_metadata.json` — final write; includes `skippedFullIntakes` listing intake IDs whose individual fetch failed but did not abort the run.
 - Optional `pdfs/intakes/` + `pdfs/consents/` when `--download-pdfs` is set.
+
+### FHIR R4 export (`--fhir`)
+
+Opt-in via `--fhir` (CLI) or the web form's FHIR checkbox. When enabled, `perform_export` runs two extra resumable fetches after the standard phases — treatment notes (`notes.json` + `_notes_pages/`, via `load_or_fetch_paged_list`) and per-client diagnoses (`fetch_diagnoses_resumable`, cached one file per client under `_diagnoses/<patient-dir>.json`) — then transforms everything to FHIR and writes one NDJSON file per resource type under `fhir/`:
+
+- `Patient.ndjson` ← clients, `Coverage.ndjson` ← client insurance fields
+- `Appointment.ndjson` ← appointments, `QuestionnaireResponse.ndjson` ← full intakes
+- `DocumentReference.ndjson` ← treatment notes, `Condition.ndjson` ← diagnoses (ICD-10-CM)
+
+The transform is a pure function (`build_fhir_resources` + the `*_to_*` mappers like `client_to_patient`, `appointment_to_fhir`); it derives stable FHIR resource ids and `Patient/<id>` references from the same `patient_reference`/`patient_dir_name` identity used by `by_patient/`, so FHIR references line up with the per-patient layout. Diagnoses (`/client/{id}/diagnoses`) are one API call per client, so `--fhir` can be slow on large accounts — the per-client cache makes it resumable. Enum/timestamp normalization lives in the mappers (`fhir_gender`, `fhir_marital_status`, `fhir_appointment_status`, `ms_to_date`/`ms_to_datetime`); raw IntakeQ strings/Unix-ms values do not validate as FHIR and must go through these. `export_metadata.json` gains `fhirEnabled` + `fhirCounts`.
 
 `load_or_fetch_paged_list` provides per-page checkpointing for paginated phases, and `fetch_full_intakes_resumable` provides per-intake checkpointing. If a phase's aggregate JSON exists and parses, it's loaded as-is and the underlying pages are not consulted; otherwise the helper walks pages 1..N, loading already-cached page files and only calling the API for missing ones. Per-intake API failures are logged + skipped (recorded in `skippedFullIntakes`) rather than aborting the whole run; whole-phase failures still propagate. To force a re-fetch, delete the relevant file (or the `_<phase>_pages/` directory) before resuming.
 

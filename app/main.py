@@ -154,6 +154,7 @@ def export_args_from_form(form: Any, output_dir: Path) -> argparse.Namespace:
         client_updated_end=None,
         deleted_clients_only=False,
         download_pdfs=form.get("download_pdfs") == "on",
+        fhir=form.get("fhir") == "on",
         max_pages=optional_int(form.get("max_pages")),
         max_intakes=optional_int(form.get("max_intakes")),
         delay_seconds=optional_float(form.get("delay_seconds"), DEFAULT_DELAY_SECONDS),
