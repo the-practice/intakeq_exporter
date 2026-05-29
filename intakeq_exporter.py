@@ -1323,7 +1323,7 @@ def perform_export(
             output_dir,
             "notes",
             api,
-            "notes",
+            "notes/summary",
             params={"startDate": args.start_date, "endDate": args.end_date},
             label="treatment notes",
             max_pages=args.max_pages,

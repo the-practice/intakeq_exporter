@@ -830,7 +830,7 @@ class PerformExportFhirTests(unittest.TestCase):
                             "Questions": [],
                             "ConsentForms": [],
                         }
-                    if path == "notes":
+                    if path == "notes/summary":
                         return (
                             [{"Id": "n1", "ClientId": 1, "NoteName": "Visit", "Date": 0}]
                             if page == 1
